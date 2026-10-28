@@ -3,7 +3,7 @@ Utilities for ILC noise, source counts and associated power spectra, etc..
 
 """
 
-import glob,os,sys,itertools,warnings
+import glob,os,sys,itertools,warnings,functools
 import numpy as np
 from scipy.interpolate import interp1d
 from orphics import maps, cosmology, io
@@ -73,11 +73,80 @@ def g_tsz(nu_ghz, T_cmb=2.726):
     x = (h * nu_ghz * 1e9) / (k * T_cmb)
     return x * (np.exp(x) + 1.0) / (np.exp(x) - 1.0) - 4.0
 
+class Passband(object):
+    """
+    Instrument passband for band-integrated ("color-corrected") foreground SEDs.
+
+    A map calibrated to CMB temperature responds to a component with monochromatic K_CMB
+    scaling s(nu) as
+
+        s_band = int tau(nu) dBnudT(nu) s(nu) dnu / int tau(nu) dBnudT(nu) dnu,
+
+    where tau is the passband transmission (Planck 2013 IX, Sec. 3.2; the integral used by
+    tilec.fg.get_mix_bandpassed). With the ACT DR6 passbands from LAMBDA, used as given,
+    this reproduces the published ACT color corrections.
+
+    Parameters
+    ----------
+    nu_ghz : array_like
+        Frequencies in GHz.
+    trans : array_like
+        Transmission at nu_ghz; the overall normalization does not matter.
+    name : str, optional
+        Label, e.g. the array and band.
+    """
+    def __init__(self, nu_ghz, trans, name=None):
+        self.nu = np.asarray(nu_ghz, dtype=float)
+        self.w = np.asarray(trans, dtype=float) * dBnudT(self.nu)
+        self.norm = _trapezoid(self.w, self.nu)
+        self.name = name
+
+    @classmethod
+    def from_file(cls, fname, name=None):
+        """Read a passband from a text file with columns: frequency (GHz), transmission."""
+        nu, trans = np.loadtxt(fname, usecols=(0,1), unpack=True)
+        return cls(nu, trans, name=name)
+
+    def integrate(self, sed):
+        """Band-integrated value of sed, a function of frequency in GHz giving the K_CMB scaling."""
+        return _trapezoid(self.w*sed(self.nu), self.nu)/self.norm
+
+    def __repr__(self):
+        return f"Passband({self.name}, {self.nu.min():.0f}-{self.nu.max():.0f} GHz)"
+
+
+def _trapezoid(y, x):
+    return (np.trapezoid if hasattr(np, 'trapezoid') else np.trapz)(y, x)
+
+
+def tsz_scale(nu):
+    """tSZ spectral function g(nu), band-integrated if nu is a Passband."""
+    return nu.integrate(g_tsz) if isinstance(nu, Passband) else g_tsz(nu)
+
+
+def mbb_scale(nu, beta, T, nu0):
+    """Modified-blackbody scaling in K_CMB normalized to 1 at nu0 (dust_mu), band-integrated if nu is a Passband."""
+    sed = lambda v: dust_mu(v, beta_d=beta, Tdust_K=T, nu0_ghz=nu0)
+    return nu.integrate(sed) if isinstance(nu, Passband) else sed(nu)
+
+
 def cltsz(atsz,nu1,nu2,clyy):
-    return atsz * g_tsz(nu1) * g_tsz(nu2) * clyy * TCMB_uK**2.
+    return atsz * tsz_scale(nu1) * tsz_scale(nu2) * clyy * TCMB_uK**2.
 
 
 # Copied from szar
+@functools.lru_cache(maxsize=None)
+def _default_theory():
+    """cosmology.default_theory(), loaded once per process."""
+    return cosmology.default_theory()
+
+@functools.lru_cache(maxsize=None)
+def _load_template(fname,delimiter=None):
+    """Read a template file once per process. The returned arrays are read-only."""
+    arrs = np.loadtxt(fname,unpack=True,delimiter=delimiter)
+    for a in arrs: a.setflags(write=False)
+    return arrs
+
 def dl_filler(ells,ls,cls,fill_type="extrapolate",fill_positive=False,silence=False):
     ells = np.asarray(ells)
     if not(silence):
@@ -113,7 +182,7 @@ def power_y_template(ells,A_tsz=None,fill_type="extrapolate",silence=False):
     ells = np.asarray(ells)
     assert np.all(ells>=0)
     root = os.path.dirname(__file__)+f"/../data/"
-    ls,icls = np.loadtxt(root+"/foregrounds/sz_template_battaglia.csv",unpack=True,delimiter=',')
+    ls,icls = _load_template(root+"/foregrounds/sz_template_battaglia.csv",delimiter=',')
     dls = dl_filler(ells,ls,icls,fill_type=fill_type,fill_positive=True,silence=silence)
     nu0 = 150.0 ; tcmb = TCMB_uK
     with np.errstate(divide='ignore'): cls = A_tsz * dls*2.*np.pi*np.nan_to_num(1./ells/(ells+1.)) / ffunc(nu0)**2./tcmb**2.
@@ -613,14 +682,14 @@ def ffunc(nu,tcmb=None):
 
 def power_ksz_reion(ells,A_rksz=1,fill_type="extrapolate",silence=False):
     root = os.path.dirname(__file__)+f"/../data/"
-    ls,icls = np.loadtxt(root+f"foregrounds/early_ksz.txt",unpack=True)
+    ls,icls = _load_template(root+"foregrounds/early_ksz.txt")
     dls = dl_filler(ells,ls,icls,fill_type=fill_type,fill_positive=True,silence=silence)
     with np.errstate(divide='ignore',over='ignore'): cls = A_rksz * dls*2.*np.pi*np.nan_to_num(1./ells/(ells+1.))
     return cls
 
 def power_ksz_late(ells,A_lksz=1,fill_type="extrapolate",silence=False):
     root = os.path.dirname(__file__)+f"/../data/"
-    ls,icls = np.loadtxt(root+f"foregrounds/late_ksz.txt",unpack=True)
+    ls,icls = _load_template(root+"foregrounds/late_ksz.txt")
     dls = dl_filler(ells,ls,icls,fill_type=fill_type,fill_positive=True,silence=silence)
     with np.errstate(divide='ignore'): cls = A_lksz * dls*2.*np.pi*np.nan_to_num(1./ells/(ells+1.))
     return cls
@@ -704,6 +773,91 @@ def wnoise_cl(sigma_uk_arcmin):
 
         
 
+def poisson_param_name(k, i):
+    return f"Sps{k}_{i}"
+
+
+def poisson_cl(p, nu_i, nu_j):
+    """
+    Poisson (shot-noise) power between channels nu_i and nu_j.
+
+    Two parameterizations are supported, selected by the keys present in p:
+
+    - Per-channel populations (default): C_ij = 1e-6 * sum_k S_k,i S_k,j, where
+      S_k,i = p["Sps{k}_{i}"] is the square-root amplitude of source population k
+      in channel i, in units of 1e-3 uK. The matrix C_ij is positive semi-definite
+      for any parameter values, so foreground correlation coefficients cannot
+      exceed 1. With non-negative S, all Poisson cross-spectra are non-negative.
+    - Per-pair amplitudes (legacy): C_ij = p["Aps_{i}_{j}"]. Kept so that older fit
+      results can still be evaluated. This form is not guaranteed to be a valid
+      covariance and should not be used for new fits.
+
+    Parameters
+    ----------
+    p : dict
+        Parameter dictionary.
+    nu_i, nu_j : int
+        Channel indices.
+
+    Returns
+    -------
+    float
+        Poisson C_ell (constant in ell) in uK^2.
+    """
+    key = f"Aps_{min(nu_i, nu_j)}_{max(nu_i, nu_j)}"
+    if key in p:
+        return p[key]
+    out = 0.0
+    k = 0
+    while poisson_param_name(k, nu_i) in p:
+        out += p[poisson_param_name(k, nu_i)] * p[poisson_param_name(k, nu_j)]
+        k += 1
+    if k == 0:
+        raise KeyError(f"No Poisson parameters found for channels {nu_i}, {nu_j}")
+    return 1e-6 * out
+
+
+def cib_cl(ell, p, nu1, nu2, pivot_cib=150., ell0=3000.):
+    """
+    Clustered CIB power between frequencies nu1 and nu2 (GHz), in K_CMB units (uK^2).
+
+    C_ell = Acib_150 * s(nu1) * s(nu2) * (ell/ell0)^-1.2, where s is the per-map spectral
+    scaling normalized to 1 at pivot_cib. Two forms are supported, selected by the keys of p:
+
+    - Modified blackbody (if p has "beta_cib"): s(nu) = dust_mu(nu, beta_cib, T_cib, pivot_cib),
+      i.e. (nu/nu0)^beta_cib B_nu(T_cib)/B_nu0(T_cib), converted from intensity to K_CMB.
+      This follows the CIB from 70 to 545 GHz.
+    - Power law (legacy): s(nu) = (nu/pivot_cib)^(alpha_cib/2), directly in K_CMB. This
+      omits the intensity to K_CMB conversion and strongly underestimates the CIB above
+      217 GHz; it is kept so that older fit results can still be evaluated.
+
+    Parameters
+    ----------
+    ell : array-like
+        Multipoles.
+    p : dict
+        Parameters: Acib_150 and either (beta_cib, T_cib) or alpha_cib.
+    nu1, nu2 : float or Passband
+        Frequencies in GHz, or passbands to integrate over.
+    pivot_cib : float, optional
+        Pivot frequency in GHz at which Acib_150 is defined.
+    ell0 : float, optional
+        Pivot multipole.
+
+    Returns
+    -------
+    ndarray
+        Clustered CIB C_ell.
+    """
+    if "beta_cib" in p:
+        s1, s2 = (mbb_scale(nu, p["beta_cib"], p["T_cib"], pivot_cib) for nu in (nu1, nu2))
+    else:
+        if isinstance(nu1, Passband) or isinstance(nu2, Passband):
+            raise ValueError("The legacy power-law CIB (alpha_cib) is not defined for passbands; use beta_cib")
+        s1, s2 = ((nu/pivot_cib)**(p["alpha_cib"]/2.) for nu in (nu1, nu2))
+    return p["Acib_150"] * s1 * s2 * (ell/ell0)**(-1.2)
+
+
 def fg_cl(ell, p, nu_i, nu_j, cl_tsz_tmpl, freqs, pivot_cib=150., components=None ):
     """Foregrounds only (no CMB, no noise)."""
     ell0 = 3000.
@@ -716,13 +870,11 @@ def fg_cl(ell, p, nu_i, nu_j, cl_tsz_tmpl, freqs, pivot_cib=150., components=Non
     
     # Poisson point sources
     if 'poisson' in components:
-        out = out + p[f"Aps_{nu_i}_{nu_j}"] #np.sqrt(p[f"Aps_{nu_i}"] * p[f"Aps_{nu_j}"])
+        out = out + poisson_cl(p, nu_i, nu_j)
 
     # Clustered CIB
     if 'cib' in components:
-        Acib150, alpha = p["Acib_150"], p["alpha_cib"] # change name to beta
-        out = out +( np.sqrt((Acib150 * (nu1/pivot_cib)**alpha) *
-                         (Acib150 * (nu2/pivot_cib)**alpha)) * (ell/ell0)**(-1.2))
+        out = out + cib_cl(ell, p, nu1, nu2, pivot_cib=pivot_cib, ell0=ell0)
 
     # Thermal SZ
     if 'tsz' in components:
@@ -782,7 +934,7 @@ def model_vec(all_params, params, ell, freqs, dT_guess, beams, lknees, alphas, c
 
 def sky_model(ell,  nu_i, nu_j, p, freqs, return_fg=False, **kwargs):
     fclyy = lambda x: power_y_template(x)
-    theory = cosmology.default_theory()
+    theory = _default_theory()
     cl_cmb_tmpl = p['A_cmb']*theory.lCl('TT',ell)
     cl_yy_temp = fclyy(ell)
     fg = fg_cl(ell, p, nu_i, nu_j, cl_yy_temp, freqs, **kwargs)
@@ -820,7 +972,7 @@ def quick_fit(
         plot: bool=True,delta_ell: np.ndarray=20):
 
     fclyy = lambda x: power_y_template(x)
-    theory = cosmology.default_theory()
+    theory = _default_theory()
     fcltt = lambda x: theory.lCl('TT',x) + power_ksz_reion(x) + power_ksz_late(x)
     
 
@@ -1253,8 +1405,8 @@ def dust_C_ell_Louis25(ell, nu_i_ghz, nu_j_ghz, a_amp,
     Parameters
     ----------
     ell : array-like of multipoles
-    nu_i_ghz, nu_j_ghz : float
-        Frequencies in GHz for the two maps being crossed.
+    nu_i_ghz, nu_j_ghz : float or Passband
+        Frequencies in GHz for the two maps being crossed, or passbands to integrate over.
     a_amp : float
         Amplitude at the pivot scale (ell0) and pivot frequency (nu0), in D_ell units (uK^2).
     XY : {"TT","TE","EE"}
@@ -1287,8 +1439,8 @@ def dust_C_ell_Louis25(ell, nu_i_ghz, nu_j_ghz, a_amp,
     pos = ell > 0
     scale_ell[pos] = (ell[pos] / float(ell0)) ** float(alpha)
 
-    s_i = dust_mu(nu_i_ghz, beta_d=beta_d, Tdust_K=Tdust_K, nu0_ghz=nu0_ghz)
-    s_j = dust_mu(nu_j_ghz, beta_d=beta_d, Tdust_K=Tdust_K, nu0_ghz=nu0_ghz)
+    s_i = mbb_scale(nu_i_ghz, beta_d, Tdust_K, nu0_ghz)
+    s_j = mbb_scale(nu_j_ghz, beta_d, Tdust_K, nu0_ghz)
 
     D = float(a_amp) * scale_ell * (s_i * s_j)
     C = np.zeros_like(D)
@@ -1312,7 +1464,8 @@ def fit_cross_leastsq(
     method="trf",
     max_nfev=2000,
     xtol=1e-10,
-    verbose=0
+    verbose=0,
+    poisson_npop=2,             # number of Poisson source populations; None for legacy per-pair amplitudes
 ):
     """
     Nonlinear weighted least-squares fit using index-keyed (i,j) pairs.
@@ -1322,6 +1475,11 @@ def fit_cross_leastsq(
       - ell_cuts[(i,j)] -> boolean keep mask (Nb,) OR list of (lmin,lmax) to INCLUDE
     Frequencies:
       - nu_i = freqs_ghz[i - index_base], nu_j = freqs_ghz[j - index_base]
+    Poisson term:
+      - poisson_npop=K adds K non-negative square-root amplitudes per channel,
+        Sps{k}_{i}, so that the Poisson matrix is positive semi-definite (see
+        poisson_cl). poisson_npop=None adds one free amplitude per pair,
+        Aps_{i}_{j}, which can give correlation coefficients above 1.
     
     """
     # ---------- validate shapes ----------
@@ -1336,8 +1494,9 @@ def fit_cross_leastsq(
             raise ValueError("ell length must match P.shape[1].")
 
 
-    freqs_ghz = np.asarray(freqs_ghz, dtype=float)
-    Nf = freqs_ghz.size
+    # Entries may be frequencies in GHz or Passband objects (band-integrated SEDs)
+    freqs_ghz = [f if isinstance(f, Passband) else float(f) for f in freqs_ghz]
+    Nf = len(freqs_ghz)
     if Nf < 1:
         raise ValueError("freqs_ghz must contain at least one frequency.")
 
@@ -1405,10 +1564,21 @@ def fit_cross_leastsq(
             
     # ---------- parameters (free vs fixed) ----------
     # Add point source parameters
-    for pair in pairs:
-        i0, j0 = _norm_idx_pair(pair)
-        params0[f'Aps_{i0}_{j0}'] = 1e-5
-        bounds[f'Aps_{i0}_{j0}'] = (0,np.inf)
+    params0 = dict(params0)
+    bounds = {} if bounds is None else dict(bounds)
+    if poisson_npop is None:
+        for pair in pairs:
+            i0, j0 = _norm_idx_pair(pair)
+            params0[f'Aps_{i0}_{j0}'] = 1e-5
+            bounds[f'Aps_{i0}_{j0}'] = (0,np.inf)
+    else:
+        chans = sorted({i for pair in pairs for i in _norm_idx_pair(pair)})
+        for k in range(poisson_npop):
+            for i0 in chans:
+                name = poisson_param_name(k, i0)
+                # Unequal starting values break the symmetry between populations
+                params0.setdefault(name, 1.5 / (k + 1))
+                bounds.setdefault(name, (0, np.inf))
     
     fixed = {} if fixed is None else ( {name: params0[name] for name in fixed} if not isinstance(fixed, dict) else fixed.copy() )
     free_names = [n for n in params0.keys() if n not in fixed]

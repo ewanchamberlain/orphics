@@ -964,19 +964,49 @@ def cosine_taper(ls,lstart,lwidth):
     fl[ls>lstart+lwidth] = 0
     return fl
 
-def cosine_stitch(alm1,map2,lstitch=5200,lcosine=80,mlmax=6000):
-    # Stitch a band-limited map with a real-space map
+def cosine_stitch(alm1,map2,lstitch=5200,lcosine=80,mlmax=6000,inplace=False):
+    """
+    Stitch a band-limited map, given by its alms, with a real-space map: the alms
+    below lstitch and the real-space map above it, with a cosine transition of
+    width lcosine.
+
+    Parameters
+    ----------
+    alm1 : numpy.ndarray
+        A single alm, or T, E, B alms of shape (3, nalm).
+    map2 : enmap.ndmap
+        The real-space map, an I, Q, U map if alm1 holds T, E, B alms (spin 0, 2
+        SHTs). The output has its geometry and dtype.
+    lstitch, lcosine : int
+        Start and width of the cosine transition.
+    mlmax : int
+        Maximum multipole of the SHTs.
+    inplace : bool, optional
+        If True, map2 is overwritten (with its high-pass part), which saves one map
+        of memory.
+
+    Returns
+    -------
+    omap : enmap.ndmap
+        The stitched map.
+    """
     ls = np.arange(mlmax+2)
     fl1 = cosine_taper(ls,lstitch,lcosine)
     fl2 = np.sqrt(1.-fl1**2.)
     alm1 = change_alm_lmax(alm1,mlmax)
-    omap2 = map2 - cs.alm2map( cs.almxfl(cs.map2alm(map2,lmax=mlmax),1.-fl2),enmap.empty(map2.shape,map2.wcs,dtype=map2.dtype))
-    omap = cs.alm2map(hp.almxfl(alm1,fl1),enmap.empty(map2.shape,map2.wcs,dtype=map2.dtype)) + omap2
+    # High-pass part of map2: map2 minus its low-pass part
+    low = cs.alm2map( cs.almxfl(cs.map2alm(map2,lmax=mlmax),1.-fl2),enmap.empty(map2.shape,map2.wcs,dtype=map2.dtype))
+    omap2 = np.subtract(map2,low,out=map2) if inplace else map2 - low
+    del low
+    alm1 = hp.almxfl(alm1,fl1) if alm1.ndim==1 else np.array([hp.almxfl(a,fl1) for a in alm1])
+    omap = cs.alm2map(alm1,enmap.empty(map2.shape,map2.wcs,dtype=map2.dtype))
+    omap += omap2
     return omap
 
 def stitched_noise(shape,wcs,alm,mask,
                    rms_uk_arcmin = None,
-                   lstitch=5200,lcosine=80,mlmax=6000,alpha=-4,flmin = 700):
+                   lstitch=5200,lcosine=80,mlmax=6000,alpha=-4,flmin = 700,
+                   dtype=None):
     """
     Stitch constant (homogenous) white-noise to a band-limited noise
     sim realization.
@@ -988,13 +1018,26 @@ def stitched_noise(shape,wcs,alm,mask,
     wcs : `astropy.wcs.WCS`
         WCS object describing the output noise map.
     alm : `numpy.ndarray`
-        The alms of the band-limited noise sim.
+        The alms of the band-limited noise sim: a single alm, or T, E, B alms of
+        shape (3, nalm), in which case the output is an I, Q, U map.
+    mask : `numpy.ndarray`
+        Boolean map of the region with noise; the output is zero outside it.
+    rms_uk_arcmin : float or sequence, optional
+        White noise level in uK-arcmin. For T, E, B alms, a single value or one per
+        I, Q, U map. If None, it is fit to the power of each alm above flmin; Q and U
+        then share the level fit to E and B.
     lstitch : int
         The multipole at which to begin tapering off the alm noise sim.
     lcosine : int
         The width of the cosine taper to apply to the alm noise sim at its tail end.
     mlmax : int
         The maximum multipole up to which to do SHTs; this can just be a bit larger than the band-limit of the alm noise sim.
+    alpha, flmin : float
+        Red noise slope and minimum multipole of the white noise level fit.
+    dtype : numpy dtype, optional
+        Precision of the output map. By default float32 for single-precision
+        (complex64) alms and float64 otherwise. The white noise is drawn from the
+        global numpy random state (np.random.standard_normal) in either case.
 
     Returns
     -------
@@ -1002,26 +1045,51 @@ def stitched_noise(shape,wcs,alm,mask,
         The stitched noise map.
     """
 
+    pol = alm.ndim==2
+    if pol and alm.shape[0]!=3: raise ValueError("alm must be a single alm or T, E, B alms")
     if rms_uk_arcmin is None:
         from scipy.optimize import curve_fit as cfit
-        # Get noise power of input alm
         w2 = wfactor(2,mask)
-        wcls = cs.alm2cl(alm)/w2
-        ls = np.arange(wcls.size)
-        # Fit to red+white noise
         rfunc = lambda ls,rms_noise, lknee : rednoise(ls,rms_noise,lknee=lknee,alpha=alpha)
-        popt,pcov = cfit(rfunc,ls[ls>flmin],wcls[ls>flmin],p0=[1e-3,1000])
-        rms = popt[0]
+        def fit_rms(a):
+            # Get noise power of input alm and fit to red+white noise
+            wcls = cs.alm2cl(a)/w2
+            ls = np.arange(wcls.size)
+            popt,pcov = cfit(rfunc,ls[ls>flmin],wcls[ls>flmin],p0=[1e-3,1000])
+            return popt[0]
+        if pol:
+            rt,re,rb = [fit_rms(a) for a in alm]
+            rp = np.sqrt((re**2+rb**2)/2.)  # white Q, U noise has equal E and B power
+            rms = np.array([rt,rp,rp])
+        else:
+            rms = fit_rms(alm)
     else:
         rms = rms_uk_arcmin
 
-    # Generate white noise map
-    wmap = white_noise(shape,wcs,rms)
-    wmap[~mask] = 0
+    if dtype is None: dtype = np.float32 if alm.dtype==np.complex64 else np.float64
 
-    # Stitch noise
-    omap = cosine_stitch(alm1=alm,map2=wmap,lstitch=lstitch,lcosine=lcosine,mlmax=mlmax)
-    omap[~mask] = 0
+    # Generate white noise map (I, Q, U for T, E, B alms), one map at a time in double
+    # precision: standard normal / sqrt(pixel inverse variance), which depends on the
+    # row only for a cylindrical map
+    oshape = (3,)+tuple(shape[-2:]) if pol else tuple(shape)
+    div = ivar((shape[-2],1),wcs,1. if pol else rms)
+    wmap = enmap.empty(oshape,wcs,dtype=dtype)
+    if pol:
+        rms = np.asarray(rms,dtype=float)*np.ones(3)
+        for i in range(3):
+            w = np.random.standard_normal(oshape[1:])
+            w /= np.sqrt(div)
+            w *= rms[i]
+            wmap[i] = w
+            del w
+    else:
+        wmap[...] = np.random.standard_normal(oshape) / np.sqrt(div)
+    wmap[...,~mask] = 0
+
+    # Stitch noise (wmap is overwritten)
+    omap = cosine_stitch(alm1=alm,map2=wmap,lstitch=lstitch,lcosine=lcosine,mlmax=mlmax,inplace=True)
+    del wmap
+    omap[...,~mask] = 0
     return omap
 
 
