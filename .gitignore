@@ -100,3 +100,4 @@ input/*local.ini
 data/*.dat
 data/*.csv
 input/*.dat
+.vscode
